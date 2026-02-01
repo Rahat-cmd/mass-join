@@ -1,12 +1,54 @@
 const axios = require('axios');
 const fs = require('fs');
 const WebSocket = require('ws');
-const path = require('path');
+const readline = require('readline-sync');
 const config = require('./config.json');
 
+/* =======================
+   REMOTE LICENSE CHECK (LIVE)
+   ======================= */
+
+// RAW GitHub link to your keys.json
+const LICENSE_URL = "https://raw.githubusercontent.com/Rahat-cmd/license-server/main/keys.json";
+
+async function checkCode() {
+    const userCode = readline.question("Enter your 4-digit code: ").trim();
+
+    if (!/^\d{4}$/.test(userCode)) {
+        console.error("❌ Code must be 4 digits!");
+        process.exit(1);
+    }
+
+    try {
+        // Fetch live keys with cache prevention
+        const res = await axios.get(LICENSE_URL + "?t=" + Date.now(), {
+            timeout: 5000,
+            headers: { 'Cache-Control': 'no-cache', 'Accept': 'application/json' }
+        });
+
+        let keys = res.data;
+        if (typeof keys === 'string') keys = JSON.parse(keys);
+
+        // Live check
+        if (keys[userCode] === true) {
+            console.log("✅ Code accepted. Running script...");
+        } else {
+            console.error("❌ Wrong code or disabled. Access denied!");
+            process.exit(1);
+        }
+
+    } catch (err) {
+        console.error("❌ Could not reach license server. Try again later.", err.message);
+        process.exit(1);
+    }
+}
+
+/* =======================
+   DISCORD VC SCRIPT
+   ======================= */
+
 const FILEPATH = './tokens.txt';
-const INTERVAL = 5 * 60 * 1000;
-const GATEWAY_URL =  "wss://gateway.discord.gg/?v=10&encoding=json";
+const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
 const DISCORD_USER_URL = "https://discord.com/api/v9/users/@me";
 
 function getTimestamp() {
@@ -22,27 +64,18 @@ function readAndSortTokens(filepath) {
 
 async function checkToken(token, index) {
     try {
-        await axios.get(DISCORD_USER_URL, {
-            headers: { Authorization: token }
-        });
+        await axios.get(DISCORD_USER_URL, { headers: { Authorization: token } });
         console.log(`${getTimestamp()} Token ${index + 1} is valid`);
         return token;
-    } catch (error) {
-        if (error.response && error.response.status === 401) {
-            console.error(`${getTimestamp()} Token ${index + 1} is invalid, remove or replace it from tokens.txt`);
-        } else {
-            console.error(`${getTimestamp()} Error checking token ${index + 1}: ${error.message}`);
-        }
+    } catch {
+        console.error(`${getTimestamp()} Token ${index + 1} invalid`);
         return null;
     }
 }
 
 async function validateTokens(tokens) {
-    console.log(`${getTimestamp()} Validating ${tokens.length} tokens...`);
-    const results = await Promise.all(tokens.map((token, index) => checkToken(token, index)));
-    const validTokens = tokens.filter((_, i) => results[i] !== null);
-    console.log(`${getTimestamp()} ${validTokens.length}/${tokens.length} tokens are valid.`);
-    return validTokens;
+    const results = await Promise.all(tokens.map(checkToken));
+    return tokens.filter((_, i) => results[i] !== null);
 }
 
 function wsJoin(token) {
@@ -50,69 +83,47 @@ function wsJoin(token) {
     let heartbeatInterval = null;
     let sequence = null;
 
-    const auth = {
-        op: 2,
-        d: {
-            token,
-            properties: {
-                os: 'Linux',
-                browser: 'Firefox',
-                device: 'desktop'
-            }
-        }
-    };
-
-    const vc = {
-        op: 4,
-        d: {
-            guild_id: config.GUILD_ID,
-            channel_id: config.VC_CHANNEL,
-            self_mute: !!config.MUTED,
-            self_deaf: !!config.DEAFEN
-        }
-    };
-
     ws.on('open', () => {
-        ws.send(JSON.stringify(auth));
-        console.info(`${getTimestamp()} ${token.slice(0, 10)}... connected and identified`);
+        ws.send(JSON.stringify({
+            op: 2,
+            d: { token, properties: { os: 'Linux', browser: 'Firefox', device: 'desktop' } }
+        }));
     });
 
     ws.on('message', (data) => {
-        try {
-            const payload = JSON.parse(data);
-            const { op, t, s, d } = payload;
-            if (s) sequence = s;
+        const payload = JSON.parse(data);
+        const { op, s, d } = payload;
+        if (s) sequence = s;
 
-            if (op === 10) { // Hello
-                const interval = d.heartbeat_interval * 0.9; // slight jitter
-                if (heartbeatInterval) clearInterval(heartbeatInterval);
-                heartbeatInterval = setInterval(() => {
-                    ws.send(JSON.stringify({ op: 1, d: sequence }));
-                }, interval);
+        if (op === 10) {
+            heartbeatInterval = setInterval(() => {
+                ws.send(JSON.stringify({ op: 1, d: sequence }));
+            }, d.heartbeat_interval * 0.9);
 
-                // Join voice shortly after identify
-                setTimeout(() => {
-                    ws.send(JSON.stringify(vc));
-                    console.info(`${getTimestamp()} ${token.slice(0, 10)}... joined voice channel`);
-                }, 2000);
-            }
-        } catch (e) {
-            console.error(`${getTimestamp()} Parse error:`, e.message);
+            setTimeout(() => {
+                ws.send(JSON.stringify({
+                    op: 4,
+                    d: {
+                        guild_id: config.GUILD_ID,
+                        channel_id: config.VC_CHANNEL,
+                        self_mute: !!config.MUTED,
+                        self_deaf: !!config.DEAFEN
+                    }
+                }));
+                console.log(`${getTimestamp()} ${token.slice(0, 8)}... joined VC`);
+            }, 2000);
         }
     });
 
-    ws.on('close', (code) => {
-        console.info(`${getTimestamp()} ${token.slice(0, 10)}... disconnected (${code}), reconnecting in 5-10s...`);
+    ws.on('close', () => {
         if (heartbeatInterval) clearInterval(heartbeatInterval);
-        ws = null;
-        // Auto-reconnect
         setTimeout(() => wsJoin(token), 5000 + Math.random() * 5000);
     });
-
-    ws.on('error', (err) => {
-        console.error(`${getTimestamp()} WS Error (${token.slice(0, 10)}...): ${err.message}`);
-    });
 }
+
+/* =======================
+   MAIN
+   ======================= */
 
 async function main() {
     if (!fs.existsSync(FILEPATH)) {
@@ -121,32 +132,19 @@ async function main() {
     }
 
     const tokens = readAndSortTokens(FILEPATH);
-    if (tokens.length === 0) {
-        console.error(`${getTimestamp()} No tokens in tokens.txt`);
-        return;
-    }
-
     const validTokens = await validateTokens(tokens);
-    if (validTokens.length === 0) {
-        console.error(`${getTimestamp()} No valid tokens found. Exiting.`);
-        return;
-    }
 
-    console.log(`${getTimestamp()} Starting ${validTokens.length} voice connections with stagger...`);
+    console.log(`${getTimestamp()} Starting ${validTokens.length} voice connections...`);
 
-    // Staggered join to avoid rate limits
-    validTokens.forEach((token, index) => {
-        setTimeout(() => {
-            wsJoin(token);
-        }, index * 2000); // 2-second delay between each account
+    validTokens.forEach((token, i) => {
+        setTimeout(() => wsJoin(token), i * 2000);
     });
 }
 
-
-main();
-
-
-
-
-
-
+/* =======================
+   RUN LICENSE CHECK THEN MAIN
+   ======================= */
+(async () => {
+    await checkCode(); // ✅ check license live
+    main();            // ✅ run VC only if license valid
+})();
